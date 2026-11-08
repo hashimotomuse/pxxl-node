@@ -3,8 +3,10 @@
 // Node.js listens on $PORT and proxies WebSocket upgrades at /airport to
 // an Xray process bound to 127.0.0.1. The Xray binary is downloaded on
 // first start from the official Xray-core GitHub release.
-// The app directory is read-only at runtime on Pxxl, so the binary,
-// config and download all live in the OS temp directory (writable).
+// Pxxl's runtime is strict: the app directory (/workspace/app) is read-only
+// and /tmp is mounted noexec, so this file probes several directories for
+// one that is both writable AND executable (/var/tmp, $HOME, /dev/shm, /tmp)
+// and runs Xray from the first that works.
 // The HTTP server starts listening on $PORT immediately, so the platform
 // health check passes while Xray is still downloading.
 // Required env var: UUID (the VLESS client id). Optional: WS_PATH (default /airport).
@@ -22,12 +24,15 @@ const WS_PATH = process.env.WS_PATH || '/airport';
 const UUID = process.env.UUID || process.env.VLESS_UUID || '';
 const XRAY_PORT = parseInt(process.env.XRAY_PORT || '10800', 10);
 const XRAY_URL = process.env.XRAY_URL || 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip';
-const WORKDIR = path.join(os.tmpdir(), 'pxxl-node');
-const XRAY_BIN = path.join(WORKDIR, 'xray');
-const CONFIG_PATH = path.join(WORKDIR, 'config.json');
-const ZIP_PATH = path.join(WORKDIR, 'xray.zip');
-
-try { fs.mkdirSync(WORKDIR, { recursive: true }); } catch (e) {}
+let homeDir = '';
+try { homeDir = os.homedir(); } catch (e) {}
+const CANDIDATE_DIRS = [...new Set([
+  process.env.XRAY_DIR || '',
+  '/var/tmp/pxxl-node',
+  homeDir ? path.join(homeDir, '.pxxl-node') : '',
+  '/dev/shm/pxxl-node',
+  path.join(os.tmpdir(), 'pxxl-node'),
+].filter(Boolean))];
 
 if (!UUID) {
   console.error('[pxxl-node] UUID environment variable is not set. Set UUID in the Pxxl dashboard and redeploy.');
@@ -54,7 +59,7 @@ function download(url, dest, redirects) {
 }
 
 // Extract only the "xray" entry from a zip file using only Node built-ins.
-function extractXrayZip(zipPath) {
+function extractXrayZip(zipPath, binPath) {
   const buf = fs.readFileSync(zipPath);
   let off = 0;
   while (off + 30 <= buf.length) {
@@ -73,7 +78,7 @@ function extractXrayZip(zipPath) {
       if (method === 0) out = Buffer.from(data);
       else if (method === 8) out = zlib.inflateRawSync(data);
       else throw new Error('unsupported zip method ' + method);
-      fs.writeFileSync(XRAY_BIN, out, { mode: 0o755 });
+      fs.writeFileSync(binPath, out, { mode: 0o755 });
       return true;
     }
     off = dataStart + compSize;
@@ -81,32 +86,59 @@ function extractXrayZip(zipPath) {
   return false;
 }
 
-function tryUnzip(zipPath) {
+function tryUnzip(zipPath, dir) {
   return new Promise((resolve) => {
-    execFile('unzip', ['-o', zipPath, 'xray', '-d', WORKDIR], (err) => {
+    execFile('unzip', ['-o', zipPath, 'xray', '-d', dir], (err) => {
       if (err) return resolve(false);
-      try { fs.chmodSync(XRAY_BIN, 0o755); resolve(fs.existsSync(XRAY_BIN)); } catch (e) { resolve(false); }
+      try { fs.chmodSync(path.join(dir, 'xray'), 0o755); resolve(fs.existsSync(path.join(dir, 'xray'))); } catch (e) { resolve(false); }
     });
   });
 }
 
-async function ensureXray() {
-  if (fs.existsSync(XRAY_BIN)) {
-    try { fs.chmodSync(XRAY_BIN, 0o755); } catch (e) {}
-    console.log('[pxxl-node] xray binary already present');
-    return;
-  }
-  console.log('[pxxl-node] downloading Xray from ' + XRAY_URL);
-  await download(XRAY_URL, ZIP_PATH);
-  console.log('[pxxl-node] extracting xray binary');
-  let ok = false;
-  try { ok = extractXrayZip(ZIP_PATH); } catch (e) { console.log('[pxxl-node] built-in unzip failed: ' + e.message); }
-  if (!ok) ok = await tryUnzip(ZIP_PATH);
-  try { fs.unlinkSync(ZIP_PATH); } catch (e) {}
-  if (!ok || !fs.existsSync(XRAY_BIN)) throw new Error('could not obtain the xray binary');
+// A directory is usable only if files can be executed from it (/tmp is noexec on Pxxl).
+function probeDir(dir) {
+  return new Promise((resolve) => {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, 'probe.sh');
+      fs.writeFileSync(probe, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      execFile(probe, (err) => {
+        try { fs.unlinkSync(probe); } catch (e) {}
+        if (err) {
+          console.log('[pxxl-node] cannot execute files in ' + dir + ': ' + err.message);
+          return resolve(false);
+        }
+        resolve(true);
+      });
+    } catch (e) {
+      console.log('[pxxl-node] cannot use ' + dir + ': ' + e.message);
+      resolve(false);
+    }
+  });
 }
 
-function writeConfig() {
+async function ensureXray(dir) {
+  const bin = path.join(dir, 'xray');
+  const zip = path.join(dir, 'xray.zip');
+  if (fs.existsSync(bin)) {
+    try { fs.chmodSync(bin, 0o755); } catch (e) {}
+    console.log('[pxxl-node] xray binary already present in ' + dir);
+    return true;
+  }
+  console.log('[pxxl-node] downloading Xray from ' + XRAY_URL);
+  await download(XRAY_URL, zip);
+  console.log('[pxxl-node] extracting xray binary');
+  let ok = false;
+  try { ok = extractXrayZip(zip, bin); } catch (e) { console.log('[pxxl-node] built-in unzip failed: ' + e.message); }
+  if (!ok) ok = await tryUnzip(zip, dir);
+  try { fs.unlinkSync(zip); } catch (e) {}
+  if (ok && fs.existsSync(bin)) {
+    try { console.log('[pxxl-node] xray binary mode: ' + (fs.statSync(bin).mode & 0o777).toString(8)); } catch (e) {}
+  }
+  return ok && fs.existsSync(bin);
+}
+
+function writeConfig(dir) {
   const config = {
     log: { loglevel: 'warning' },
     inbounds: [{
@@ -118,7 +150,37 @@ function writeConfig() {
     }],
     outbounds: [{ protocol: 'freedom', settings: {} }]
   };
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(config, null, 2));
+}
+
+function startXray(dir) {
+  const bin = path.join(dir, 'xray');
+  const cfg = path.join(dir, 'config.json');
+  return new Promise((resolve) => {
+    let settled = false;
+    const xray = spawn(bin, ['run', '-c', cfg], { stdio: ['ignore', 'inherit', 'inherit'] });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.log('[pxxl-node] xray started from ' + dir);
+      xray.on('exit', (code) => { console.error('[pxxl-node] xray exited with code ' + code); process.exit(code || 1); });
+      resolve('running');
+    }, 2000);
+    xray.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      console.error('[pxxl-node] failed to start xray in ' + dir + ': ' + err.message);
+      resolve('spawn_error');
+    });
+    xray.on('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      console.error('[pxxl-node] xray exited early in ' + dir + ' with code ' + code);
+      resolve('exited_early');
+    });
+  });
 }
 
 async function main() {
@@ -148,17 +210,20 @@ async function main() {
   server.listen(PORT, () => {
     console.log('[pxxl-node] listening on port ' + PORT + ', WebSocket path ' + WS_PATH + ', Xray on 127.0.0.1:' + XRAY_PORT);
   });
-  // Start Xray in the background; health checks already pass via the HTTP server above.
-  try {
-    await ensureXray();
-    writeConfig();
-    const xray = spawn(XRAY_BIN, ['run', '-c', CONFIG_PATH], { stdio: ['ignore', 'inherit', 'inherit'] });
-    xray.on('exit', (code) => { console.error('[pxxl-node] xray exited with code ' + code); process.exit(code || 1); });
-    xray.on('error', (err) => { console.error('[pxxl-node] failed to start xray: ' + err.message); process.exit(1); });
-    xrayReady = true;
-    console.log('[pxxl-node] xray started');
-  } catch (err) {
-    console.error('[pxxl-node] ' + (err && err.message ? err.message : err));
+  for (const dir of CANDIDATE_DIRS) {
+    console.log('[pxxl-node] trying working directory ' + dir);
+    if (!(await probeDir(dir))) continue;
+    try {
+      if (!(await ensureXray(dir))) { console.log('[pxxl-node] could not obtain the xray binary in ' + dir); continue; }
+      writeConfig(dir);
+      const result = await startXray(dir);
+      if (result === 'running') { xrayReady = true; break; }
+    } catch (err) {
+      console.error('[pxxl-node] setup failed in ' + dir + ': ' + (err && err.message ? err.message : err));
+    }
+  }
+  if (!xrayReady) {
+    console.error('[pxxl-node] no working directory for the Xray binary. Tried: ' + CANDIDATE_DIRS.join(', ') + '. The app directory is read-only and /tmp is mounted noexec.');
     process.exit(1);
   }
 }
