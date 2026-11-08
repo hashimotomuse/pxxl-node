@@ -1,0 +1,13 @@
+{
+  "name": "pxxl-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Xray VLESS + WebSocket server for Pxxl",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
